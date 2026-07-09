@@ -1,0 +1,406 @@
+import discord
+from discord.ext import commands, tasks
+import asyncio
+import os
+import json
+import aiohttp
+from checker import UsernameChecker
+from datetime import datetime
+
+# Configuración
+TOKEN = os.getenv('DISCORD_TOKEN')  # Token del bot
+PREFIX = ','
+
+# Leer los 3 tokens de cuentas desde variables separadas
+TOKENS = []
+for i in range(1, 4):
+    token = os.getenv(f'DISCORD_TOKEN{i}')
+    if token:
+        TOKENS.append(token.strip())
+
+# Intents
+intents = discord.Intents.default()
+intents.message_content = True
+
+bot = commands.Bot(command_prefix=PREFIX, intents=intents)
+
+# Almacenamiento
+webhooks_data = {}
+checker_instances = {}
+
+class DiscordChecker(UsernameChecker):
+    def __init__(self, webhook_url, guild_id, tokens):
+        super().__init__(tokens)
+        self.webhook_url = webhook_url
+        self.guild_id = guild_id
+        self.session = None
+        self.stats = {
+            'checked': 0,
+            'available': 0,
+            'errors': 0,
+            'start_time': None
+        }
+        self.infinite_mode = False
+        
+    async def send_available_embed(self, username):
+        """Envía un embed al webhook cuando encuentra un nombre disponible"""
+        try:
+            # Solo enviar si es 3 o 4 caracteres (para modo infinite)
+            if self.infinite_mode and len(username) not in [3, 4]:
+                return True
+                
+            async with self.session.post(self.webhook_url, json={
+                "embeds": [{
+                    "title": "✅ Nombre Disponible Encontrado",
+                    "description": f"**`{username}`**",
+                    "color": 0x00ff00,
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "footer": {
+                        "text": f"Discord Username Checker | Cuenta: {self.current_token_index + 1}/3"
+                    },
+                    "fields": [
+                        {
+                            "name": "Longitud",
+                            "value": str(len(username)),
+                            "inline": True
+                        },
+                        {
+                            "name": "Caracteres",
+                            "value": self._analyze_chars(username),
+                            "inline": True
+                        },
+                        {
+                            "name": "Modo",
+                            "value": "Infinito" if self.infinite_mode else "Limitado",
+                            "inline": True
+                        },
+                        {
+                            "name": "Total revisados",
+                            "value": str(self.stats['checked']),
+                            "inline": True
+                        }
+                    ]
+                }]
+            }) as response:
+                if response.status in [204, 200]:
+                    print(f"[+] Embed enviado para: {username}")
+                    return True
+                else:
+                    print(f"[!] Error enviando embed: {response.status}")
+                    return False
+        except Exception as e:
+            print(f"[!] Error enviando embed: {e}")
+            return False
+    
+    def _analyze_chars(self, username):
+        """Analiza los caracteres del username"""
+        types = []
+        if any(c.isdigit() for c in username):
+            types.append("Números")
+        if any(c.isalpha() for c in username):
+            types.append("Letras")
+        if '_' in username:
+            types.append("Guiones bajos")
+        return ", ".join(types) if types else "N/A"
+
+@bot.event
+async def on_ready():
+    print(f'Bot conectado como {bot.user}')
+    print(f'ID: {bot.user.id}')
+    print(f'Cuentas disponibles: {len(TOKENS)}/3')
+    for i, t in enumerate(TOKENS, 1):
+        masked = t[:15] + "..." if len(t) > 20 else t
+        print(f'  Cuenta {i}: {masked}')
+    print('------')
+
+@bot.command()
+async def set(ctx, webhook_url: str = None):
+    """Configura el webhook donde se enviarán los nombres disponibles"""
+    if not webhook_url:
+        await ctx.send("❌ **Debes proporcionar una URL de webhook.**\nUso: `,set <webhook_url>`")
+        return
+    
+    if not webhook_url.startswith('https://discord.com/api/webhooks/'):
+        await ctx.send("❌ **URL de webhook inválida.**")
+        return
+    
+    if len(TOKENS) < 3:
+        await ctx.send(f"❌ **Solo hay {len(TOKENS)}/3 cuentas configuradas.**\nAgrega DISCORD_TOKEN1, DISCORD_TOKEN2 y DISCORD_TOKEN3 en las variables de entorno.")
+        return
+    
+    webhooks_data[ctx.guild.id] = {
+        'url': webhook_url,
+        'channel_id': ctx.channel.id,
+        'set_by': ctx.author.id
+    }
+    
+    with open('webhooks.json', 'w') as f:
+        json.dump(webhooks_data, f)
+    
+    embed = discord.Embed(
+        title="✅ Webhook Configurado",
+        description="Los nombres disponibles se enviarán al webhook.",
+        color=0x00ff00
+    )
+    embed.add_field(name="Cuentas disponibles", value=f"{len(TOKENS)}/3", inline=True)
+    embed.add_field(name="Comandos", value="`,start` o `,infinite`", inline=True)
+    
+    await ctx.send(embed=embed)
+
+@bot.command()
+async def start(ctx, length: int = None, amount: int = 100):
+    """Inicia el checker de usernames (modo limitado)"""
+    await run_checker_command(ctx, length, amount, infinite=False)
+
+@bot.command()
+async def infinite(ctx):
+    """
+    Inicia búsqueda INFINITA de nombres de 3-4 caracteres
+    Solo envía al webhook cuando encuentra nombres de 3 o 4 letras
+    """
+    await run_checker_command(ctx, length=None, amount=None, infinite=True)
+
+async def run_checker_command(ctx, length, amount, infinite):
+    """Ejecuta el checker (comando interno)"""
+    guild_id = ctx.guild.id
+    
+    if guild_id not in webhooks_data:
+        await ctx.send("❌ **Primero configura un webhook con `,set <url>`**")
+        return
+    
+    if guild_id in checker_instances and checker_instances[guild_id].running:
+        await ctx.send("⚠️ **El checker ya está corriendo.** Usa `,stop` para detenerlo.")
+        return
+    
+    if len(TOKENS) < 3:
+        await ctx.send(f"❌ **Necesitas 3 cuentas configuradas.** Actualmente: {len(TOKENS)}/3")
+        return
+    
+    webhook_url = webhooks_data[guild_id]['url']
+    
+    # Crear instancia del checker
+    checker = DiscordChecker(webhook_url, guild_id, TOKENS)
+    checker_instances[guild_id] = checker
+    checker.infinite_mode = infinite
+    
+    # Iniciar sesión HTTP
+    checker.session = aiohttp.ClientSession()
+    checker.stats['start_time'] = datetime.utcnow()
+    
+    # Embed de inicio
+    embed = discord.Embed(
+        title="🔍 Iniciando Búsqueda" + (" INFINITA" if infinite else ""),
+        color=0x3498db
+    )
+    
+    if infinite:
+        embed.description = "Modo infinito activado. Solo se notificarán nombres de **3 o 4 caracteres**."
+        embed.add_field(name="Longitud", value="3-4 caracteres", inline=True)
+        embed.add_field(name="Límite", value="Sin límite ♾️", inline=True)
+    else:
+        embed.add_field(name="Longitud", value=str(length) if length else "2-4", inline=True)
+        embed.add_field(name="Cantidad", value=str(amount), inline=True)
+    
+    embed.add_field(name="Cuentas", value="3/3", inline=True)
+    
+    await ctx.send(embed=embed)
+    
+    # Iniciar el checker
+    checker.running = True
+    bot.loop.create_task(run_checker(ctx, checker, length, amount, infinite))
+
+async def run_checker(ctx, checker, length, amount, infinite):
+    """Ejecuta el checker en background"""
+    message = await ctx.send("⏳ **Iniciando...**")
+    last_update = 0
+    
+    try:
+        while checker.running:
+            # En modo infinito, solo generar 3-4 caracteres
+            if infinite:
+                username = checker.generate_username(length=None, only_3_4=True)
+            else:
+                if checker.stats['checked'] >= amount:
+                    break
+                username = checker.generate_username(length=length, only_3_4=False)
+            
+            # Verificar
+            result = await checker.check_username(username)
+            checker.stats['checked'] += 1
+            
+            if result['available']:
+                checker.stats['available'] += 1
+                # En modo infinito, solo notificar si es 3-4 caracteres
+                if infinite and len(username) in [3, 4]:
+                    await checker.send_available_embed(username)
+                elif not infinite:
+                    await checker.send_available_embed(username)
+            
+            if result['error']:
+                checker.stats['errors'] += 1
+            
+            # Actualizar progreso cada 10 checks o cada 30 segundos
+            current_time = asyncio.get_event_loop().time()
+            if checker.stats['checked'] % 10 == 0 or (current_time - last_update) > 30:
+                last_update = current_time
+                
+                progress_embed = discord.Embed(
+                    title="🔍 Buscando..." + (" (INFINITO)" if infinite else ""),
+                    color=0xf39c12
+                )
+                progress_embed.add_field(
+                    name="Revisados", 
+                    value=str(checker.stats['checked']), 
+                    inline=True
+                )
+                progress_embed.add_field(
+                    name="Disponibles", 
+                    value=str(checker.stats['available']), 
+                    inline=True
+                )
+                progress_embed.add_field(
+                    name="Errores", 
+                    value=str(checker.stats['errors']), 
+                    inline=True
+                )
+                
+                if infinite:
+                    progress_embed.add_field(
+                        name="Velocidad",
+                        value=f"{checker.stats['checked'] / max(1, (datetime.utcnow() - checker.stats['start_time']).total_seconds()):.1f}/s",
+                        inline=True
+                    )
+                else:
+                    progress_embed.add_field(
+                        name="Progreso",
+                        value=f"{checker.stats['checked']}/{amount}",
+                        inline=True
+                    )
+                
+                progress_embed.add_field(
+                    name="Cuenta activa",
+                    value=f"{checker.current_token_index + 1}/3",
+                    inline=True
+                )
+                
+                await message.edit(embed=progress_embed)
+            
+            # Delay adaptativo
+            delay = result.get('retry_after', 1.5)
+            await asyncio.sleep(delay)
+        
+        # Finalizar (solo si no es infinito)
+        if not infinite:
+            duration = (datetime.utcnow() - checker.stats['start_time']).total_seconds()
+            
+            final_embed = discord.Embed(
+                title="✅ Búsqueda Completada",
+                color=0x00ff00
+            )
+            final_embed.add_field(name="Total revisados", value=str(checker.stats['checked']), inline=True)
+            final_embed.add_field(name="Disponibles", value=str(checker.stats['available']), inline=True)
+            final_embed.add_field(name="Errores", value=str(checker.stats['errors']), inline=True)
+            final_embed.add_field(name="Duración", value=f"{duration:.1f}s", inline=True)
+            
+            await ctx.send(embed=final_embed)
+    
+    except Exception as e:
+        error_embed = discord.Embed(
+            title="❌ Error",
+            description=str(e),
+            color=0xe74c3c
+        )
+        await ctx.send(embed=error_embed)
+    
+    finally:
+        checker.running = False
+        if checker.session:
+            await checker.session.close()
+
+@bot.command()
+async def stop(ctx):
+    """Detiene el checker"""
+    guild_id = ctx.guild.id
+    
+    if guild_id in checker_instances:
+        checker = checker_instances[guild_id]
+        checker.running = False
+        
+        # Estadísticas finales
+        duration = (datetime.utcnow() - checker.stats['start_time']).total_seconds()
+        
+        embed = discord.Embed(
+            title="🛑 Checker Detenido",
+            color=0xe74c3c
+        )
+        embed.add_field(name="Total revisados", value=str(checker.stats['checked']), inline=True)
+        embed.add_field(name="Disponibles", value=str(checker.stats['available']), inline=True)
+        embed.add_field(name="Duración", value=f"{duration:.1f}s", inline=True)
+        
+        await ctx.send(embed=embed)
+        
+        if checker.session:
+            await checker.session.close()
+    else:
+        await ctx.send("⚠️ No hay ningún checker corriendo.")
+
+@bot.command()
+async def status(ctx):
+    """Muestra el estado del checker"""
+    guild_id = ctx.guild.id
+    
+    if guild_id in checker_instances and checker_instances[guild_id].running:
+        checker = checker_instances[guild_id]
+        duration = (datetime.utcnow() - checker.stats['start_time']).total_seconds()
+        
+        embed = discord.Embed(
+            title="🟢 Checker Corriendo" + (" (INFINITO)" if checker.infinite_mode else ""),
+            color=0x00ff00
+        )
+        embed.add_field(name="Revisados", value=str(checker.stats['checked']))
+        embed.add_field(name="Disponibles", value=str(checker.stats['available']))
+        embed.add_field(name="Errores", value=str(checker.stats['errors']))
+        embed.add_field(name="Velocidad", value=f"{checker.stats['checked']/max(1,duration):.1f}/s")
+        embed.add_field(name="Cuenta activa", value=f"{checker.current_token_index + 1}/3")
+        
+        if checker.infinite_mode:
+            embed.set_footer(text="Modo infinito activo - Solo notifica nombres de 3-4 caracteres")
+        
+        await ctx.send(embed=embed)
+    else:
+        await ctx.send("🔴 **El checker está detenido.**")
+
+@bot.command()
+async def accounts(ctx):
+    """Muestra las 3 cuentas configuradas"""
+    if not TOKENS:
+        await ctx.send("❌ No hay cuentas configuradas.")
+        return
+    
+    embed = discord.Embed(
+        title="🔑 Cuentas Configuradas",
+        description=f"Total: {len(TOKENS)}/3",
+        color=0x9b59b6
+    )
+    
+    for i, token in enumerate(TOKENS, 1):
+        masked = token[:15] + "..." + token[-5:] if len(token) > 25 else token
+        status = "✅ Activa" if token else "❌ Vacía"
+        embed.add_field(name=f"Cuenta {i}", value=f"`{masked}`\n{status}", inline=False)
+    
+    if len(TOKENS) < 3:
+        missing = 3 - len(TOKENS)
+        embed.add_field(
+            name="⚠️ Faltan cuentas",
+            value=f"Agrega {missing} cuenta(s) más en las variables de entorno",
+            inline=False
+        )
+    
+    await ctx.send(embed=embed)
+
+# Cargar webhooks guardados
+if os.path.exists('webhooks.json'):
+    with open('webhooks.json', 'r') as f:
+        webhooks_data = json.load(f)
+
+bot.run(TOKEN)
