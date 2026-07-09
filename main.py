@@ -1,406 +1,321 @@
+# main.py - Versión mejorada con persistencia y envío a canal
+
 import discord
 from discord.ext import commands, tasks
 import asyncio
+import random
+import string
+import aiohttp
 import os
 import json
-import aiohttp
-from checker import UsernameChecker
 from datetime import datetime
 
 # Configuración
-TOKEN = os.getenv('DISCORD_TOKEN')  # Token del bot
-PREFIX = ','
+TOKEN = os.getenv('DISCORD_TOKEN')
+CHECK_INTERVAL = 0.5  # segundos entre verificaciones
 
-# Leer los 3 tokens de cuentas desde variables separadas
-TOKENS = []
-for i in range(1, 4):
-    token = os.getenv(f'DISCORD_TOKEN{i}')
-    if token:
-        TOKENS.append(token.strip())
+# Archivos de persistencia
+CHECKED_NAMES_FILE = "checked_names.json"
+CONFIG_FILE = "config.json"
 
-# Intents
+# Cargar nombres ya verificados
+def load_checked_names():
+    if os.path.exists(CHECKED_NAMES_FILE):
+        with open(CHECKED_NAMES_FILE, 'r') as f:
+            data = json.load(f)
+            return set(data.get("unavailable", [])), set(data.get("errors", [])), set(data.get("available", []))
+    return set(), set(), set()
+
+# Guardar nombres verificados
+def save_checked_names(unavailable, errors, available):
+    with open(CHECKED_NAMES_FILE, 'w') as f:
+        json.dump({
+            "unavailable": list(unavailable),
+            "errors": list(errors),
+            "available": list(available)
+        }, f)
+
+# Cargar configuración
+def load_config():
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE, 'r') as f:
+            return json.load(f)
+    return {}
+
+# Guardar configuración
+def save_config(config):
+    with open(CONFIG_FILE, 'w') as f:
+        json.dump(config, f)
+
+# Cargar datos al inicio
+checked_unavailable, checked_errors, checked_available = load_checked_names()
+all_checked = checked_unavailable.union(checked_errors).union(checked_available)
+config = load_config()
+
 intents = discord.Intents.default()
 intents.message_content = True
+bot = commands.Bot(command_prefix=",", intents=intents)
 
-bot = commands.Bot(command_prefix=PREFIX, intents=intents)
-
-# Almacenamiento
-webhooks_data = {}
-checker_instances = {}
-
-class DiscordChecker(UsernameChecker):
-    def __init__(self, webhook_url, guild_id, tokens):
-        super().__init__(tokens)
-        self.webhook_url = webhook_url
-        self.guild_id = guild_id
-        self.session = None
-        self.stats = {
-            'checked': 0,
-            'available': 0,
-            'errors': 0,
-            'start_time': None
-        }
-        self.infinite_mode = False
-        
-    async def send_available_embed(self, username):
-        """Envía un embed al webhook cuando encuentra un nombre disponible"""
-        try:
-            # Solo enviar si es 3 o 4 caracteres (para modo infinite)
-            if self.infinite_mode and len(username) not in [3, 4]:
-                return True
-                
-            async with self.session.post(self.webhook_url, json={
-                "embeds": [{
-                    "title": "✅ Nombre Disponible Encontrado",
-                    "description": f"**`{username}`**",
-                    "color": 0x00ff00,
-                    "timestamp": datetime.utcnow().isoformat(),
-                    "footer": {
-                        "text": f"Discord Username Checker | Cuenta: {self.current_token_index + 1}/3"
-                    },
-                    "fields": [
-                        {
-                            "name": "Longitud",
-                            "value": str(len(username)),
-                            "inline": True
-                        },
-                        {
-                            "name": "Caracteres",
-                            "value": self._analyze_chars(username),
-                            "inline": True
-                        },
-                        {
-                            "name": "Modo",
-                            "value": "Infinito" if self.infinite_mode else "Limitado",
-                            "inline": True
-                        },
-                        {
-                            "name": "Total revisados",
-                            "value": str(self.stats['checked']),
-                            "inline": True
-                        }
-                    ]
-                }]
-            }) as response:
-                if response.status in [204, 200]:
-                    print(f"[+] Embed enviado para: {username}")
-                    return True
-                else:
-                    print(f"[!] Error enviando embed: {response.status}")
-                    return False
-        except Exception as e:
-            print(f"[!] Error enviando embed: {e}")
-            return False
+def generate_username():
+    """Genera un nombre aleatorio de 3, 4 o 5 caracteres que no haya sido verificado antes"""
+    max_attempts = 1000
     
-    def _analyze_chars(self, username):
-        """Analiza los caracteres del username"""
-        types = []
-        if any(c.isdigit() for c in username):
-            types.append("Números")
-        if any(c.isalpha() for c in username):
-            types.append("Letras")
-        if '_' in username:
-            types.append("Guiones bajos")
-        return ", ".join(types) if types else "N/A"
+    for _ in range(max_attempts):
+        length = random.choice([3, 4, 5])
+        username = ''.join(random.choices(string.ascii_lowercase + string.digits, k=length))
+        
+        if username not in all_checked:
+            return username
+    
+    return None  # Si no encuentra ninguno nuevo después de 1000 intentos
+
+async def check_username(username):
+    """Verifica si un nombre de usuario está disponible en Discord"""
+    url = f"https://discord.com/api/v9/users/{username}"
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json",
+        "Authorization": f"Bot {TOKEN}"
+    }
+    
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(url, headers=headers) as response:
+                if response.status == 404:
+                    return "available"
+                elif response.status == 200:
+                    return "unavailable"
+                elif response.status == 429:
+                    return "rate_limited"
+                else:
+                    return "error"
+        except Exception as e:
+            print(f"Error al verificar {username}: {e}")
+            return "error"
 
 @bot.event
 async def on_ready():
     print(f'Bot conectado como {bot.user}')
-    print(f'ID: {bot.user.id}')
-    print(f'Cuentas disponibles: {len(TOKENS)}/3')
-    for i, t in enumerate(TOKENS, 1):
-        masked = t[:15] + "..." if len(t) > 20 else t
-        print(f'  Cuenta {i}: {masked}')
-    print('------')
+    print(f'Nombres verificados previamente: {len(all_checked)}')
+    print(f'Nombres disponibles encontrados: {len(checked_available)}')
+    
+    # Iniciar el loop de verificación si hay un canal configurado
+    if config.get("channel_id"):
+        check_usernames.start()
+        print(f"Verificación automática activada en canal ID: {config['channel_id']}")
 
 @bot.command()
-async def set(ctx, webhook_url: str = None):
-    """Configura el webhook donde se enviarán los nombres disponibles"""
-    if not webhook_url:
-        await ctx.send("❌ **Debes proporcionar una URL de webhook.**\nUso: `,set <webhook_url>`")
+async def set(ctx, channel: discord.TextChannel = None):
+    """Configura el canal donde se enviarán los nombres disponibles"""
+    if channel is None:
+        await ctx.send("❌ Debes mencionar un canal. Ejemplo: `,set #nombres-disponibles`")
         return
     
-    if not webhook_url.startswith('https://discord.com/api/webhooks/'):
-        await ctx.send("❌ **URL de webhook inválida.**")
-        return
+    config["channel_id"] = channel.id
+    save_config(config)
     
-    if len(TOKENS) < 3:
-        await ctx.send(f"❌ **Solo hay {len(TOKENS)}/3 cuentas configuradas.**\nAgrega DISCORD_TOKEN1, DISCORD_TOKEN2 y DISCORD_TOKEN3 en las variables de entorno.")
-        return
-    
-    webhooks_data[ctx.guild.id] = {
-        'url': webhook_url,
-        'channel_id': ctx.channel.id,
-        'set_by': ctx.author.id
-    }
-    
-    with open('webhooks.json', 'w') as f:
-        json.dump(webhooks_data, f)
-    
-    embed = discord.Embed(
-        title="✅ Webhook Configurado",
-        description="Los nombres disponibles se enviarán al webhook.",
-        color=0x00ff00
-    )
-    embed.add_field(name="Cuentas disponibles", value=f"{len(TOKENS)}/3", inline=True)
-    embed.add_field(name="Comandos", value="`,start` o `,infinite`", inline=True)
-    
-    await ctx.send(embed=embed)
-
-@bot.command()
-async def start(ctx, length: int = None, amount: int = 100):
-    """Inicia el checker de usernames (modo limitado)"""
-    await run_checker_command(ctx, length, amount, infinite=False)
-
-@bot.command()
-async def infinite(ctx):
-    """
-    Inicia búsqueda INFINITA de nombres de 3-4 caracteres
-    Solo envía al webhook cuando encuentra nombres de 3 o 4 letras
-    """
-    await run_checker_command(ctx, length=None, amount=None, infinite=True)
-
-async def run_checker_command(ctx, length, amount, infinite):
-    """Ejecuta el checker (comando interno)"""
-    guild_id = ctx.guild.id
-    
-    if guild_id not in webhooks_data:
-        await ctx.send("❌ **Primero configura un webhook con `,set <url>`**")
-        return
-    
-    if guild_id in checker_instances and checker_instances[guild_id].running:
-        await ctx.send("⚠️ **El checker ya está corriendo.** Usa `,stop` para detenerlo.")
-        return
-    
-    if len(TOKENS) < 3:
-        await ctx.send(f"❌ **Necesitas 3 cuentas configuradas.** Actualmente: {len(TOKENS)}/3")
-        return
-    
-    webhook_url = webhooks_data[guild_id]['url']
-    
-    # Crear instancia del checker
-    checker = DiscordChecker(webhook_url, guild_id, TOKENS)
-    checker_instances[guild_id] = checker
-    checker.infinite_mode = infinite
-    
-    # Iniciar sesión HTTP
-    checker.session = aiohttp.ClientSession()
-    checker.stats['start_time'] = datetime.utcnow()
-    
-    # Embed de inicio
-    embed = discord.Embed(
-        title="🔍 Iniciando Búsqueda" + (" INFINITA" if infinite else ""),
-        color=0x3498db
-    )
-    
-    if infinite:
-        embed.description = "Modo infinito activado. Solo se notificarán nombres de **3 o 4 caracteres**."
-        embed.add_field(name="Longitud", value="3-4 caracteres", inline=True)
-        embed.add_field(name="Límite", value="Sin límite ♾️", inline=True)
+    # Reiniciar el task si ya estaba corriendo
+    if check_usernames.is_running():
+        check_usernames.restart()
     else:
-        embed.add_field(name="Longitud", value=str(length) if length else "2-4", inline=True)
-        embed.add_field(name="Cantidad", value=str(amount), inline=True)
+        check_usernames.start()
     
-    embed.add_field(name="Cuentas", value="3/3", inline=True)
-    
-    await ctx.send(embed=embed)
-    
-    # Iniciar el checker
-    checker.running = True
-    bot.loop.create_task(run_checker(ctx, checker, length, amount, infinite))
-
-async def run_checker(ctx, checker, length, amount, infinite):
-    """Ejecuta el checker en background"""
-    message = await ctx.send("⏳ **Iniciando...**")
-    last_update = 0
-    
-    try:
-        while checker.running:
-            # En modo infinito, solo generar 3-4 caracteres
-            if infinite:
-                username = checker.generate_username(length=None, only_3_4=True)
-            else:
-                if checker.stats['checked'] >= amount:
-                    break
-                username = checker.generate_username(length=length, only_3_4=False)
-            
-            # Verificar
-            result = await checker.check_username(username)
-            checker.stats['checked'] += 1
-            
-            if result['available']:
-                checker.stats['available'] += 1
-                # En modo infinito, solo notificar si es 3-4 caracteres
-                if infinite and len(username) in [3, 4]:
-                    await checker.send_available_embed(username)
-                elif not infinite:
-                    await checker.send_available_embed(username)
-            
-            if result['error']:
-                checker.stats['errors'] += 1
-            
-            # Actualizar progreso cada 10 checks o cada 30 segundos
-            current_time = asyncio.get_event_loop().time()
-            if checker.stats['checked'] % 10 == 0 or (current_time - last_update) > 30:
-                last_update = current_time
-                
-                progress_embed = discord.Embed(
-                    title="🔍 Buscando..." + (" (INFINITO)" if infinite else ""),
-                    color=0xf39c12
-                )
-                progress_embed.add_field(
-                    name="Revisados", 
-                    value=str(checker.stats['checked']), 
-                    inline=True
-                )
-                progress_embed.add_field(
-                    name="Disponibles", 
-                    value=str(checker.stats['available']), 
-                    inline=True
-                )
-                progress_embed.add_field(
-                    name="Errores", 
-                    value=str(checker.stats['errors']), 
-                    inline=True
-                )
-                
-                if infinite:
-                    progress_embed.add_field(
-                        name="Velocidad",
-                        value=f"{checker.stats['checked'] / max(1, (datetime.utcnow() - checker.stats['start_time']).total_seconds()):.1f}/s",
-                        inline=True
-                    )
-                else:
-                    progress_embed.add_field(
-                        name="Progreso",
-                        value=f"{checker.stats['checked']}/{amount}",
-                        inline=True
-                    )
-                
-                progress_embed.add_field(
-                    name="Cuenta activa",
-                    value=f"{checker.current_token_index + 1}/3",
-                    inline=True
-                )
-                
-                await message.edit(embed=progress_embed)
-            
-            # Delay adaptativo
-            delay = result.get('retry_after', 1.5)
-            await asyncio.sleep(delay)
-        
-        # Finalizar (solo si no es infinito)
-        if not infinite:
-            duration = (datetime.utcnow() - checker.stats['start_time']).total_seconds()
-            
-            final_embed = discord.Embed(
-                title="✅ Búsqueda Completada",
-                color=0x00ff00
-            )
-            final_embed.add_field(name="Total revisados", value=str(checker.stats['checked']), inline=True)
-            final_embed.add_field(name="Disponibles", value=str(checker.stats['available']), inline=True)
-            final_embed.add_field(name="Errores", value=str(checker.stats['errors']), inline=True)
-            final_embed.add_field(name="Duración", value=f"{duration:.1f}s", inline=True)
-            
-            await ctx.send(embed=final_embed)
-    
-    except Exception as e:
-        error_embed = discord.Embed(
-            title="❌ Error",
-            description=str(e),
-            color=0xe74c3c
-        )
-        await ctx.send(embed=error_embed)
-    
-    finally:
-        checker.running = False
-        if checker.session:
-            await checker.session.close()
+    await ctx.send(f"✅ Canal configurado: {channel.mention}\nLos nombres disponibles se enviarán aquí automáticamente.")
 
 @bot.command()
 async def stop(ctx):
-    """Detiene el checker"""
-    guild_id = ctx.guild.id
-    
-    if guild_id in checker_instances:
-        checker = checker_instances[guild_id]
-        checker.running = False
-        
-        # Estadísticas finales
-        duration = (datetime.utcnow() - checker.stats['start_time']).total_seconds()
-        
-        embed = discord.Embed(
-            title="🛑 Checker Detenido",
-            color=0xe74c3c
-        )
-        embed.add_field(name="Total revisados", value=str(checker.stats['checked']), inline=True)
-        embed.add_field(name="Disponibles", value=str(checker.stats['available']), inline=True)
-        embed.add_field(name="Duración", value=f"{duration:.1f}s", inline=True)
-        
-        await ctx.send(embed=embed)
-        
-        if checker.session:
-            await checker.session.close()
+    """Detiene la verificación automática"""
+    if check_usernames.is_running():
+        check_usernames.cancel()
+        await ctx.send("⏹️ Verificación automática detenida.")
     else:
-        await ctx.send("⚠️ No hay ningún checker corriendo.")
+        await ctx.send("ℹ️ La verificación ya está detenida.")
 
 @bot.command()
-async def status(ctx):
-    """Muestra el estado del checker"""
-    guild_id = ctx.guild.id
-    
-    if guild_id in checker_instances and checker_instances[guild_id].running:
-        checker = checker_instances[guild_id]
-        duration = (datetime.utcnow() - checker.stats['start_time']).total_seconds()
-        
-        embed = discord.Embed(
-            title="🟢 Checker Corriendo" + (" (INFINITO)" if checker.infinite_mode else ""),
-            color=0x00ff00
-        )
-        embed.add_field(name="Revisados", value=str(checker.stats['checked']))
-        embed.add_field(name="Disponibles", value=str(checker.stats['available']))
-        embed.add_field(name="Errores", value=str(checker.stats['errors']))
-        embed.add_field(name="Velocidad", value=f"{checker.stats['checked']/max(1,duration):.1f}/s")
-        embed.add_field(name="Cuenta activa", value=f"{checker.current_token_index + 1}/3")
-        
-        if checker.infinite_mode:
-            embed.set_footer(text="Modo infinito activo - Solo notifica nombres de 3-4 caracteres")
-        
-        await ctx.send(embed=embed)
-    else:
-        await ctx.send("🔴 **El checker está detenido.**")
-
-@bot.command()
-async def accounts(ctx):
-    """Muestra las 3 cuentas configuradas"""
-    if not TOKENS:
-        await ctx.send("❌ No hay cuentas configuradas.")
+async def start(ctx):
+    """Inicia la verificación automática"""
+    if not config.get("channel_id"):
+        await ctx.send("❌ Primero configura un canal con `,set #canal`")
         return
     
-    embed = discord.Embed(
-        title="🔑 Cuentas Configuradas",
-        description=f"Total: {len(TOKENS)}/3",
-        color=0x9b59b6
-    )
+    if check_usernames.is_running():
+        await ctx.send("ℹ️ La verificación ya está activa.")
+    else:
+        check_usernames.start()
+        channel = bot.get_channel(config["channel_id"])
+        await ctx.send(f"▶️ Verificación automática iniciada en {channel.mention if channel else 'el canal configurado'}.")
+
+@bot.command()
+async def stats(ctx):
+    """Muestra estadísticas de nombres verificados"""
+    embed = discord.Embed(title="📊 Estadísticas", color=discord.Color.blue())
+    embed.add_field(name="Total verificados", value=len(all_checked), inline=True)
+    embed.add_field(name="No disponibles", value=len(checked_unavailable), inline=True)
+    embed.add_field(name="Disponibles encontrados", value=len(checked_available), inline=True)
+    embed.add_field(name="Con error", value=len(checked_errors), inline=True)
     
-    for i, token in enumerate(TOKENS, 1):
-        masked = token[:15] + "..." + token[-5:] if len(token) > 25 else token
-        status = "✅ Activa" if token else "❌ Vacía"
-        embed.add_field(name=f"Cuenta {i}", value=f"`{masked}`\n{status}", inline=False)
-    
-    if len(TOKENS) < 3:
-        missing = 3 - len(TOKENS)
-        embed.add_field(
-            name="⚠️ Faltan cuentas",
-            value=f"Agrega {missing} cuenta(s) más en las variables de entorno",
-            inline=False
-        )
+    if checked_available:
+        recent = list(checked_available)[-5:]
+        embed.add_field(name="Últimos disponibles", value=", ".join(recent), inline=False)
     
     await ctx.send(embed=embed)
 
-# Cargar webhooks guardados
-if os.path.exists('webhooks.json'):
-    with open('webhooks.json', 'r') as f:
-        webhooks_data = json.load(f)
+@bot.command()
+async def reset(ctx, confirm: str = None):
+    """Limpia la lista de nombres verificados (usar con precaución)"""
+    if confirm != "confirmar":
+        await ctx.send("⚠️ Esto borrará TODO el historial de nombres verificados.\n"
+                      "Si estás seguro, escribe: `,reset confirmar`")
+        return
+    
+    global checked_unavailable, checked_errors, checked_available, all_checked
+    
+    checked_unavailable.clear()
+    checked_errors.clear()
+    checked_available.clear()
+    all_checked.clear()
+    
+    save_checked_names(checked_unavailable, checked_errors, checked_available)
+    await ctx.send("🗑️ Historial de nombres verificados eliminado.")
+
+@bot.command()
+async def checkone(ctx, *, username: str = None):
+    """Verifica un nombre específico manualmente"""
+    if not username:
+        await ctx.send("❌ Debes proporcionar un nombre. Ejemplo: `,checkone abc`")
+        return
+    
+    username = username.lower().strip()
+    
+    if username in all_checked:
+        if username in checked_available:
+            await ctx.send(f"✅ `{username}` ya fue verificado y está **DISPONIBLE**")
+        elif username in checked_unavailable:
+            await ctx.send(f"❌ `{username}` ya fue verificado y está **NO DISPONIBLE**")
+        else:
+            await ctx.send(f"⚠️ `{username}` ya fue verificado y dio **ERROR**")
+        return
+    
+    msg = await ctx.send(f"🔍 Verificando `{username}`...")
+    
+    result = await check_username(username)
+    
+    if result == "available":
+        checked_available.add(username)
+        all_checked.add(username)
+        save_checked_names(checked_unavailable, checked_errors, checked_available)
+        
+        embed = discord.Embed(
+            title="✅ Nombre Disponible",
+            description=f"**`{username}`**",
+            color=discord.Color.green(),
+            timestamp=datetime.now()
+        )
+        embed.set_footer(text="Revisa disponibilidad en Discord")
+        await ctx.send(embed=embed)
+        await msg.edit(content=f"✅ `{username}` está disponible")
+        
+    elif result == "unavailable":
+        checked_unavailable.add(username)
+        all_checked.add(username)
+        save_checked_names(checked_unavailable, checked_errors, checked_available)
+        await msg.edit(content=f"❌ `{username}` no está disponible")
+        
+    elif result == "rate_limited":
+        await msg.edit(content=f"⏳ Rate limit alcanzado. Espera un momento...")
+        
+    else:
+        checked_errors.add(username)
+        all_checked.add(username)
+        save_checked_names(checked_unavailable, checked_errors, checked_available)
+        await msg.edit(content=f"⚠️ Error al verificar `{username}`. Se guardó para no repetir.")
+
+@tasks.loop(seconds=CHECK_INTERVAL)
+async def check_usernames():
+    """Loop principal de verificación automática"""
+    if not config.get("channel_id"):
+        return
+    
+    channel = bot.get_channel(config["channel_id"])
+    if not channel:
+        print(f"Error: No se encontró el canal {config['channel_id']}")
+        return
+    
+    # Generar nombre no verificado previamente
+    username = generate_username()
+    
+    if username is None:
+        print("⚠️ Se agotaron las combinaciones posibles o se alcanzó el límite de intentos")
+        await channel.send("⚠️ Advertencia: Se están agotando las combinaciones de nombres disponibles.")
+        check_usernames.cancel()
+        return
+    
+    result = await check_username(username)
+    
+    if result == "available":
+        # Guardar en disponibles
+        checked_available.add(username)
+        all_checked.add(username)
+        save_checked_names(checked_unavailable, checked_errors, checked_available)
+        
+        # Enviar embed al canal
+        embed = discord.Embed(
+            title="✅ Nombre Disponible Encontrado",
+            description=f"**`{username}`**",
+            color=discord.Color.green(),
+            timestamp=datetime.now()
+        )
+        embed.add_field(name="Longitud", value=f"{len(username)} caracteres", inline=True)
+        embed.add_field(name="Total encontrados", value=len(checked_available), inline=True)
+        embed.set_footer(text="Haz clic para copiar el nombre")
+        
+        await channel.send(embed=embed)
+        print(f"✅ Nombre disponible encontrado: {username}")
+        
+    elif result == "unavailable":
+        # Guardar como no disponible
+        checked_unavailable.add(username)
+        all_checked.add(username)
+        save_checked_names(checked_unavailable, checked_errors, checked_available)
+        print(f"❌ No disponible: {username}")
+        
+    elif result == "rate_limited":
+        print("⏳ Rate limit alcanzado, esperando...")
+        await asyncio.sleep(5)
+        
+    else:
+        # Guardar como error para no repetir
+        checked_errors.add(username)
+        all_checked.add(username)
+        save_checked_names(checked_unavailable, checked_errors, checked_available)
+        print(f"⚠️ Error con: {username} (guardado en blacklist)")
+
+@check_usernames.before_loop
+async def before_check():
+    await bot.wait_until_ready()
+
+# Comando de ayuda actualizado
+@bot.command()
+async def help(ctx):
+    """Muestra la ayuda del bot"""
+    embed = discord.Embed(
+        title="🤖 Comandos Disponibles",
+        description="Bot de verificación de nombres de usuario (3-5 caracteres)",
+        color=discord.Color.blue()
+    )
+    
+    embed.add_field(name=",set #canal", value="Configura el canal para enviar nombres disponibles", inline=False)
+    embed.add_field(name=",start", value="Inicia la verificación automática", inline=False)
+    embed.add_field(name=",stop", value="Detiene la verificación automática", inline=False)
+    embed.add_field(name=",stats", value="Muestra estadísticas de nombres verificados", inline=False)
+    embed.add_field(name=",checkone <nombre>", value="Verifica un nombre específico manualmente", inline=False)
+    embed.add_field(name=",reset confirmar", value="Limpia el historial de nombres (⚠️ peligroso)", inline=False)
+    embed.add_field(name=",help", value="Muestra este mensaje", inline=False)
+    
+    await ctx.send(embed=embed)
+
+# Sobrescribir el comando help original
+bot.remove_command('help')
 
 bot.run(TOKEN)
