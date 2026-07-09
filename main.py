@@ -1,4 +1,4 @@
-# main.py - Versión mejorada con persistencia y envío a canal
+# main.py - Versión corregida
 
 import discord
 from discord.ext import commands, tasks
@@ -54,7 +54,7 @@ config = load_config()
 
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix=",", intents=intents)
+bot = commands.Bot(command_prefix=",", intents=intents, help_command=None)  # Desactivar help por defecto
 
 def generate_username():
     """Genera un nombre aleatorio de 3, 4 o 5 caracteres que no haya sido verificado antes"""
@@ -105,8 +105,8 @@ async def on_ready():
         check_usernames.start()
         print(f"Verificación automática activada en canal ID: {config['channel_id']}")
 
-@bot.command()
-async def set(ctx, channel: discord.TextChannel = None):
+@bot.command(name="set")
+async def set_channel(ctx, channel: discord.TextChannel = None):
     """Configura el canal donde se enviarán los nombres disponibles"""
     if channel is None:
         await ctx.send("❌ Debes mencionar un canal. Ejemplo: `,set #nombres-disponibles`")
@@ -295,7 +295,6 @@ async def check_usernames():
 async def before_check():
     await bot.wait_until_ready()
 
-# Comando de ayuda actualizado
 @bot.command()
 async def help(ctx):
     """Muestra la ayuda del bot"""
@@ -314,8 +313,5 @@ async def help(ctx):
     embed.add_field(name=",help", value="Muestra este mensaje", inline=False)
     
     await ctx.send(embed=embed)
-
-# Sobrescribir el comando help original
-bot.remove_command('help')
 
 bot.run(TOKEN)
